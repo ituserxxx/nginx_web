@@ -11,6 +11,9 @@
 # Test binary, built with `go test -c`
 *.test
 
+# 系统与编辑器产生的临时文件（macOS ._ 文件、临时日志等）
+._*
+
 # Code coverage profiles and other test artifacts
 *.out
 coverage.*

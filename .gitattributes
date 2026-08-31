@@ -1,0 +1,17 @@
+# 覆盖 core.autocrlf=true 的影响：脚本必须是 LF，否则 WSL/Linux 下
+# 会报 /usr/bin/env: 'bash\r': No such file or directory
+*.sh        text eol=lf
+*.bash      text eol=lf
+
+# 源码统一 LF，避免混用换行导致 diff 噪音
+*.go        text eol=lf
+*.js        text eol=lf
+*.vue       text eol=lf
+*.json      text eol=lf
+*.css       text eol=lf
+*.html      text eol=lf
+*.md        text eol=lf
+
+# 二进制文件，禁止任何换行转换与 diff
+*.png       binary
+*.svg       text eol=lf
