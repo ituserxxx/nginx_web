@@ -1,6 +1,10 @@
 package main
 
 import (
+	"archive/tar"
+	"archive/zip"
+	"bytes"
+	"compress/gzip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -435,30 +439,177 @@ func TestParseSiteConf(t *testing.T) {
     server_name www.example.com;
     root /var/www/example.com;
 }`
-	domain, listen, root := parseSiteConf(content)
-	if domain != "www.example.com" {
-		t.Errorf("domain = %q，期望 www.example.com", domain)
+	sc := parseSiteConf(content)
+	if sc.Domain != "www.example.com" {
+		t.Errorf("domain = %q，期望 www.example.com", sc.Domain)
 	}
-	if listen != 8080 {
-		t.Errorf("listen = %d，期望 8080", listen)
+	if sc.Listen != 8080 {
+		t.Errorf("listen = %d，期望 8080", sc.Listen)
 	}
-	if root != "/var/www/example.com" {
-		t.Errorf("root = %q，期望 /var/www/example.com", root)
+	if sc.Root != "/var/www/example.com" {
+		t.Errorf("root = %q，期望 /var/www/example.com", sc.Root)
+	}
+	if sc.ProxyPort != 0 || sc.SSL {
+		t.Errorf("静态站点不应解析出代理/SSL: %+v", sc)
 	}
 }
 
 func TestRenderSiteConfRoundTrip(t *testing.T) {
-	domain, listen, root := "api.example.com", 8443, "/srv/api"
-	content := renderSiteConf(domain, listen, root)
-	gotDomain, gotListen, gotRoot := parseSiteConf(content)
-	if gotDomain != domain || gotListen != listen || gotRoot != root {
-		t.Errorf("render→parse 不守恒: 入(%s,%d,%s) 出(%s,%d,%s)",
-			domain, listen, root, gotDomain, gotListen, gotRoot)
+	in := siteInput{Domain: "api.example.com", Listen: 8443, Root: "/srv/api"}
+	content := renderSiteConf(in)
+	sc := parseSiteConf(content)
+	if sc.Domain != in.Domain || sc.Listen != in.Listen || sc.Root != in.Root {
+		t.Errorf("render→parse 不守恒: 入(%+v) 出(%+v)", in, sc)
 	}
-	// 渲染产物必须含 include 所需的 server 块与关键字段
 	for _, must := range []string{"server {", "listen 8443;", "server_name api.example.com;", "root /srv/api;"} {
 		if !strings.Contains(content, must) {
 			t.Errorf("renderSiteConf 产物缺少关键行: %q", must)
+		}
+	}
+}
+
+// 反向代理 + HTTPS 模式的渲染与解析应守恒
+func TestRenderParseProxySSL(t *testing.T) {
+	in := siteInput{
+		Domain:    "secure.example.com",
+		Listen:    443,
+		ProxyPort: 3000,
+		SSL:       true,
+		Cert:      "/etc/nginx/certs/fullchain.pem",
+		Key:       "/etc/nginx/certs/privkey.pem",
+	}
+	content := renderSiteConf(in)
+	sc := parseSiteConf(content)
+	if sc.Listen != 443 {
+		t.Errorf("listen = %d，期望 443", sc.Listen)
+	}
+	if !sc.SSL {
+		t.Error("应解析出 SSL=true")
+	}
+	if sc.ProxyPort != 3000 {
+		t.Errorf("proxyPort = %d，期望 3000", sc.ProxyPort)
+	}
+	if sc.Cert != in.Cert {
+		t.Errorf("cert = %q，期望 %q", sc.Cert, in.Cert)
+	}
+	if sc.Key != in.Key {
+		t.Errorf("key = %q，期望 %q", sc.Key, in.Key)
+	}
+	for _, must := range []string{
+		"listen 443 ssl;",
+		"ssl_certificate /etc/nginx/certs/fullchain.pem;",
+		"ssl_certificate_key /etc/nginx/certs/privkey.pem;",
+		"proxy_pass http://127.0.0.1:3000;",
+	} {
+		if !strings.Contains(content, must) {
+			t.Errorf("渲染产物缺少关键行: %q", must)
+		}
+	}
+}
+
+// 反向代理模式不应出现 root 指令
+func TestRenderProxyModeNoRoot(t *testing.T) {
+	in := siteInput{Domain: "app", Listen: 80, ProxyPort: 3000}
+	content := renderSiteConf(in)
+	if strings.Contains(content, "root ") {
+		t.Errorf("反向代理模式不应含 root 指令: %q", content)
+	}
+	if !strings.Contains(content, "proxy_pass http://127.0.0.1:3000;") {
+		t.Errorf("反向代理模式应含 proxy_pass: %q", content)
+	}
+}
+
+// 反代上游地址可自定义（非本机），且渲染/解析应守恒
+func TestRenderParseProxyCustomHost(t *testing.T) {
+	in := siteInput{
+		Domain:      "svc.example.com",
+		Listen:      80,
+		ProxyPort:   9090,
+		ProxyScheme: "https",
+		ProxyHost:   "192.168.10.20",
+	}
+	content := renderSiteConf(in)
+	sc := parseSiteConf(content)
+	if sc.ProxyScheme != "https" {
+		t.Errorf("proxyScheme = %q，期望 https", sc.ProxyScheme)
+	}
+	if sc.ProxyHost != "192.168.10.20" {
+		t.Errorf("proxyHost = %q，期望 192.168.10.20", sc.ProxyHost)
+	}
+	if sc.ProxyPort != 9090 {
+		t.Errorf("proxyPort = %d，期望 9090", sc.ProxyPort)
+	}
+	for _, must := range []string{
+		"proxy_pass https://192.168.10.20:9090;",
+	} {
+		if !strings.Contains(content, must) {
+			t.Errorf("渲染产物缺少关键行: %q", must)
+		}
+	}
+}
+
+// IPv6 上游地址渲染时应补方括号，解析后保持一致
+func TestRenderParseProxyIPv6Host(t *testing.T) {
+	in := siteInput{
+		Domain:    "ipv6app",
+		Listen:    80,
+		ProxyPort: 8080,
+		ProxyHost: "2001:db8::1",
+	}
+	content := renderSiteConf(in)
+	if !strings.Contains(content, "proxy_pass http://[2001:db8::1]:8080;") {
+		t.Errorf("IPv6 上游应补方括号: %q", content)
+	}
+	sc := parseSiteConf(content)
+	if sc.ProxyHost != "2001:db8::1" {
+		// 注意：解析直接取 [..] 内的裸地址，渲染时会重新加回方括号，往返稳定
+		t.Errorf("proxyHost = %q，期望 2001:db8::1", sc.ProxyHost)
+	}
+	if sc.ProxyPort != 8080 {
+		t.Errorf("proxyPort = %d，期望 8080", sc.ProxyPort)
+	}
+}
+
+// 反代上游留空时默认 http://127.0.0.1，与既有默认行为一致
+func TestRenderParseProxyDefaultHost(t *testing.T) {
+	in := siteInput{Domain: "defaultup", Listen: 80, ProxyPort: 3000}
+	content := renderSiteConf(in)
+	sc := parseSiteConf(content)
+	if sc.ProxyHost != "127.0.0.1" {
+		t.Errorf("默认上游地址应为 127.0.0.1，实际 %q", sc.ProxyHost)
+	}
+	if sc.ProxyScheme != "http" {
+		t.Errorf("默认协议应为 http，实际 %q", sc.ProxyScheme)
+	}
+	if sc.ProxyPort != 3000 {
+		t.Errorf("proxyPort = %d，期望 3000", sc.ProxyPort)
+	}
+}
+
+// validate 应拦截非法的反代上游地址与协议
+func TestValidateProxyHostScheme(t *testing.T) {
+	// 合法：空地址（默认回环）
+	good := []siteInput{
+		{Domain: "a.com", Listen: 80, ProxyPort: 3000},
+		{Domain: "a.com", Listen: 80, ProxyPort: 3000, ProxyHost: "192.168.1.1"},
+		{Domain: "a.com", Listen: 80, ProxyPort: 3000, ProxyHost: "backend", ProxyScheme: "http"},
+	}
+	for i, in := range good {
+		if msg := in.validate(); msg != "" {
+			t.Errorf("合法反代用例 %d 不应报错，实际: %s", i, msg)
+		}
+	}
+	bad := []siteInput{
+		// 非法协议
+		{Domain: "a.com", Listen: 80, ProxyPort: 3000, ProxyScheme: "ftp"},
+		// 含路径分隔符的恶意地址（注入指令）
+		{Domain: "a.com", Listen: 80, ProxyPort: 3000, ProxyHost: "127.0.0.1/../etc"},
+		// 八位组越界的 IPv4
+		{Domain: "a.com", Listen: 80, ProxyPort: 3000, ProxyHost: "999.999.999.999"},
+	}
+	for i, in := range bad {
+		if msg := in.validate(); msg == "" {
+			t.Errorf("非法反代用例 %d 应报错但未报错: %+v", i, in)
 		}
 	}
 }
@@ -495,6 +646,9 @@ func TestSiteInputValidate(t *testing.T) {
 		{Domain: "192.168.1.1", Listen: 80, Root: "/var/www"},
 		{Domain: "2001:db8::1", Listen: 8080, Root: "/var/www"},
 		{Domain: "_", Listen: 80, Root: "/var/www"},
+		{Domain: "app", Listen: 80, ProxyPort: 3000},                                                    // 反向代理模式免填根目录
+		{Domain: "app", Listen: 443, ProxyPort: 3000, SSL: true, Cert: "/a/c.pem", Key: "/a/k.pem"},     // 代理+HTTPS
+		{Domain: "static", Listen: 443, Root: "/var/www", SSL: true, Cert: "/a/c.pem", Key: "/a/k.pem"}, // 静态+HTTPS
 	}
 	for i, in := range good {
 		if msg := in.validate(); msg != "" {
@@ -503,16 +657,263 @@ func TestSiteInputValidate(t *testing.T) {
 	}
 	bad := []siteInput{
 		{Domain: "", Listen: 80, Root: "/var/www"},
-		{Domain: "bad/name", Listen: 80, Root: "/var/www"},        // 含非法字符
-		{Domain: "999.999.999.999", Listen: 80, Root: "/var/www"}, // 八位组越界
-		{Domain: "a.com", Listen: 0, Root: "/var/www"},            // 端口越界
-		{Domain: "a.com", Listen: 70000, Root: "/var/www"},        // 端口越界
-		{Domain: "a.com", Listen: 80, Root: ""},                   // 根目录空
-		{Domain: "a.com", Listen: 80, Root: "relative"},           // 非绝对路径
+		{Domain: "bad/name", Listen: 80, Root: "/var/www"},                          // 含非法字符
+		{Domain: "999.999.999.999", Listen: 80, Root: "/var/www"},                   // 八位组越界
+		{Domain: "a.com", Listen: 0, Root: "/var/www"},                              // 端口越界
+		{Domain: "a.com", Listen: 70000, Root: "/var/www"},                          // 端口越界
+		{Domain: "a.com", Listen: 80, Root: ""},                                     // 根目录空（静态模式）
+		{Domain: "a.com", Listen: 80, Root: "relative"},                             // 非绝对路径
+		{Domain: "a.com", Listen: 80, ProxyPort: 99999},                             // 代理端口越界
+		{Domain: "a.com", Listen: 80, SSL: true},                                    // 启用 HTTPS 但缺证书
+		{Domain: "a.com", Listen: 80, SSL: true, Cert: "/a/c.pem", Key: "relative"}, // 私钥非绝对路径
 	}
 	for i, in := range bad {
 		if msg := in.validate(); msg == "" {
 			t.Errorf("用例 %d 应报错但未报错: %+v", i, in)
 		}
+	}
+}
+
+// ---------------------------------------------------------------- 证书上传
+
+const fakeCert = `-----BEGIN CERTIFICATE-----
+MIIBfakecertificatedatahere==
+-----END CERTIFICATE-----
+`
+const fakeKey = `-----BEGIN PRIVATE KEY-----
+MIIBfakeprivatekeydatahere==
+-----END PRIVATE KEY-----
+`
+
+func TestCertDirName(t *testing.T) {
+	cases := map[string]string{
+		"example.com":  "example.com",
+		"*.example.cn": "*.example.cn",
+		"192.168.1.1":  "192.168.1.1",
+		"2001:db8::1":  "2001_db8__1", // 冒号替换为下划线，避免 Windows 下非法
+		"../escape":    "_escape",     // 斜杠被转义，前导点被去掉
+		"/etc/passwd":  "_etc_passwd", // 绝对路径转为普通名字，不再有分隔效果
+		"":             "site",        // 空值回退
+		".":            "site",        // 特殊名回退
+		"..":           "site",
+	}
+	for in, want := range cases {
+		if got := certDirName(in); got != want {
+			t.Errorf("certDirName(%q) = %q，期望 %q", in, got, want)
+		}
+	}
+}
+
+func TestCertDirFor(t *testing.T) {
+	old := installPrefix
+	installPrefix = "/usr/local/nginx"
+	defer func() { installPrefix = old }()
+
+	got := certDirFor("example.com")
+	want := filepath.Join("/usr/local/nginx", "conf", "ssl", "example.com")
+	if got != want {
+		t.Errorf("certDirFor = %q，期望 %q", got, want)
+	}
+}
+
+// buildZip 在内存中构造 zip，模拟各家 CA 下发的证书包
+func buildZip(t *testing.T, entries map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for name, content := range entries {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatalf("创建 zip 条目失败: %v", err)
+		}
+		if _, err := w.Write([]byte(content)); err != nil {
+			t.Fatalf("写入 zip 条目失败: %v", err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("关闭 zip 失败: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// buildTarGz 在内存中构造 tar.gz，含多级目录
+func buildTarGz(t *testing.T, entries map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for name, content := range entries {
+		if err := tw.WriteHeader(&tar.Header{
+			Name: name,
+			Mode: 0o644,
+			Size: int64(len(content)),
+		}); err != nil {
+			t.Fatalf("写 tar 头失败: %v", err)
+		}
+		if _, err := tw.Write([]byte(content)); err != nil {
+			t.Fatalf("写 tar 内容失败: %v", err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("关闭 tar 失败: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("关闭 gzip 失败: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestExtractCertArchiveZip(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "cert")
+	data := buildZip(t, map[string]string{
+		"fullchain.pem": fakeCert,
+		"privkey.pem":   fakeKey,
+	})
+	if err := extractCertArchive(dir, "example.com.zip", data); err != nil {
+		t.Fatalf("解压 zip 失败: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "fullchain.pem")); err != nil {
+		t.Errorf("缺少 fullchain.pem: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "privkey.pem")); err != nil {
+		t.Errorf("缺少 privkey.pem: %v", err)
+	}
+	certPath, keyPath, err := pickCertAndKey(dir)
+	if err != nil {
+		t.Fatalf("识别失败: %v", err)
+	}
+	// 关键：privkey.pem 内容是私钥，不能因为 .pem 后缀被误判成证书
+	if filepath.Base(certPath) != "fullchain.pem" {
+		t.Errorf("证书应识别为 fullchain.pem，实际 %q", certPath)
+	}
+	if filepath.Base(keyPath) != "privkey.pem" {
+		t.Errorf("私钥应识别为 privkey.pem，实际 %q", keyPath)
+	}
+}
+
+func TestExtractCertArchiveTarGzNested(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "cert")
+	data := buildTarGz(t, map[string]string{
+		"archive/fullchain.crt": fakeCert,
+		"archive/server.key":    fakeKey,
+	})
+	if err := extractCertArchive(dir, "bundle.tar.gz", data); err != nil {
+		t.Fatalf("解压 tar.gz 失败: %v", err)
+	}
+	certPath, keyPath, err := pickCertAndKey(dir)
+	if err != nil {
+		t.Fatalf("识别失败: %v", err)
+	}
+	if filepath.Base(certPath) != "fullchain.crt" {
+		t.Errorf("应递归找到嵌套证书，实际 %q", certPath)
+	}
+	if filepath.Base(keyPath) != "server.key" {
+		t.Errorf("应递归找到嵌套私钥，实际 %q", keyPath)
+	}
+}
+
+func TestExtractCertArchiveSingleFile(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "cert")
+	// 单文件：后缀非归档格式时直接落盘
+	if err := extractCertArchive(dir, "example.com.crt", []byte(fakeCert)); err != nil {
+		t.Fatalf("写入单文件失败: %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(dir, "example.com.crt"))
+	if err != nil {
+		t.Fatalf("读取失败: %v", err)
+	}
+	if string(content) != fakeCert {
+		t.Errorf("单文件内容不一致")
+	}
+}
+
+func TestExtractCertArchiveRejectsZipSlip(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "cert")
+	// 构造含 ../ 越界条目的恶意压缩包
+	data := buildZip(t, map[string]string{
+		"../../evil.pem": fakeCert,
+	})
+	err := extractCertArchive(dir, "evil.zip", data)
+	if err == nil {
+		t.Fatal("含越界路径的压缩包应被拒绝，实际解压成功")
+	}
+	if !strings.Contains(err.Error(), "越界") && !strings.Contains(err.Error(), "非法") {
+		t.Errorf("错误信息应说明路径越界，实际: %v", err)
+	}
+}
+
+func TestExtractCertArchiveRejectsAbsolutePath(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "cert")
+	data := buildTarGz(t, map[string]string{
+		"/tmp/evil.crt": fakeCert,
+	})
+	if err := extractCertArchive(dir, "evil.tar.gz", data); err == nil {
+		t.Fatal("含绝对路径的压缩包应被拒绝，实际解压成功")
+	}
+}
+
+func TestClassifyPEM(t *testing.T) {
+	cases := []struct {
+		content string
+		want    string
+	}{
+		{fakeCert, "cert"},
+		{fakeKey, "key"},
+		{"-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----\n", "key"},
+		{"-----BEGIN EC PRIVATE KEY-----\nabc\n-----END EC PRIVATE KEY-----\n", "key"},
+		{"random text", ""},
+		{"", ""},
+	}
+	for i, c := range cases {
+		if got := classifyPEM([]byte(c.content)); got != c.want {
+			t.Errorf("用例 %d: classifyPEM = %q，期望 %q", i, got, c.want)
+		}
+	}
+}
+
+func TestPickCertAndKeyFallsBackToExt(t *testing.T) {
+	dir := t.TempDir()
+	// 内容无法识别（占位文件），此时按扩展名兜底
+	if err := os.WriteFile(filepath.Join(dir, "bundle.crt"), []byte("placeholder"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "server.key"), []byte("placeholder"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	certPath, keyPath, err := pickCertAndKey(dir)
+	if err != nil {
+		t.Fatalf("识别失败: %v", err)
+	}
+	if filepath.Base(certPath) != "bundle.crt" {
+		t.Errorf("扩展名兜底应识别 bundle.crt，实际 %q", certPath)
+	}
+	if filepath.Base(keyPath) != "server.key" {
+		t.Errorf("扩展名兜底应识别 server.key，实际 %q", keyPath)
+	}
+}
+
+func TestPickCertAndKeyEmptyDir(t *testing.T) {
+	certPath, keyPath, err := pickCertAndKey(t.TempDir())
+	if err != nil {
+		t.Fatalf("空目录不应报错: %v", err)
+	}
+	if certPath != "" || keyPath != "" {
+		t.Errorf("空目录应返回空路径，实际 cert=%q key=%q", certPath, keyPath)
+	}
+}
+
+func TestListCertFiles(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "cert")
+	data := buildZip(t, map[string]string{
+		"sub/fullchain.pem": fakeCert,
+		"server.key":        fakeKey,
+	})
+	if err := extractCertArchive(dir, "b.zip", data); err != nil {
+		t.Fatalf("解压失败: %v", err)
+	}
+	got := listCertFiles(dir)
+	want := []string{"server.key", "sub/fullchain.pem"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("listCertFiles = %v，期望 %v", got, want)
 	}
 }

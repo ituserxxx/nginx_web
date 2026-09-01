@@ -37,6 +37,12 @@ go.work.sum
 node_modules/
 dist/
 
+# 单文件构建产物（build.sh 生成）
+/server/dist/
+/nginx-web
+/nginx-web.upx
+/nginx-web.gz
+
 # Editor/IDE
 # .idea/
 # .vscode/

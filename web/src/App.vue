@@ -1,12 +1,94 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { message as antdMessage } from 'ant-design-vue'
+import { UploadOutlined, LockOutlined } from '@ant-design/icons-vue'
 
 const message = ref('加载中...')
 const nginx = ref(null)
 const available = ref(null)
 const loading = ref(false)
 const backendError = ref(false)
+
+// ---------------------------------------------------------------- 登录鉴权
+// 进入安装与配置页面前需先登录。登录态由后端会话 Cookie 维持，前端仅根据
+// /api/me 判断展示登录页还是主应用；所有 /api/nginx* 接口由后端强制校验。
+const loggedIn = ref(false)
+const loginForm = reactive({ password: '' })
+const loginError = ref('')
+const loginLoading = ref(false)
+
+// 检查当前登录态：已登录则拉取初始数据，否则停留在登录页
+async function checkAuth() {
+  try {
+    const res = await fetch('/api/me', { credentials: 'same-origin' })
+    const data = await res.json()
+    if (data.authenticated) {
+      loggedIn.value = true
+      await afterLoginLoad()
+    } else {
+      loggedIn.value = false
+    }
+  } catch {
+    loggedIn.value = false
+  }
+}
+
+// 登录成功后执行的初始化加载（与 onMounted 原逻辑一致）
+async function afterLoginLoad() {
+  try {
+    const res = await fetch('/api/hello')
+    const data = await res.json()
+    message.value = data.message
+  } catch {
+    message.value = '后端连接失败'
+  }
+  await detect()
+  await loadSites()
+}
+
+async function login() {
+  loginLoading.value = true
+  loginError.value = ''
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ password: loginForm.password }),
+    })
+    const data = await res.json()
+    if (!res.ok || data.error) {
+      loginError.value = data.error || '登录失败'
+      return
+    }
+    loggedIn.value = true
+    loginForm.password = ''
+    await afterLoginLoad()
+  } catch (e) {
+    loginError.value = '登录请求失败: ' + e.message
+  } finally {
+    loginLoading.value = false
+  }
+}
+
+async function logout() {
+  try {
+    await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' })
+  } catch {
+    // 忽略登出网络错误，前端直接回到登录页
+  }
+  loggedIn.value = false
+  sites.value = null
+}
+
+// 接口返回 401 视为登录失效，自动退回登录页
+function handleUnauthorized(res) {
+  if (res && res.status === 401) {
+    loggedIn.value = false
+    return true
+  }
+  return false
+}
 
 // 版本号归一化：两个接口返回的版本格式并不一致，需要提取主版本段才能比对。
 //   nginx -v           -> nginx/1.24.0        -> 1.24.0
@@ -66,6 +148,7 @@ async function detect() {
       fetch('/api/nginx'),
       fetch('/api/nginx/available'),
     ])
+    if (handleUnauthorized(nginxRes) || handleUnauthorized(availableRes)) return
     if (!nginxRes.ok || !availableRes.ok) {
       throw new Error('请求失败')
     }
@@ -296,16 +379,8 @@ watch(installLogs, () => {
   })
 })
 
-onMounted(async () => {
-  try {
-    const res = await fetch('/api/hello')
-    const data = await res.json()
-    message.value = data.message
-  } catch {
-    message.value = '后端连接失败'
-  }
-  await detect()
-  await loadSites()
+onMounted(() => {
+  checkAuth()
 })
 
 // ---------------------------------------------------------------- 站点配置
@@ -320,8 +395,10 @@ const configDirPath = ref('')
 const siteColumns = [
   { title: '配置文件', dataIndex: 'file' },
   { title: '域名 / IP', dataIndex: 'domain' },
-  { title: '端口', dataIndex: 'listen', width: 90, align: 'center' },
+  { title: '端口', dataIndex: 'listen', width: 80, align: 'center' },
   { title: '根目录', dataIndex: 'root' },
+  { title: '反代目标', dataIndex: 'proxyPort', width: 200, align: 'center' },
+  { title: 'HTTPS', dataIndex: 'ssl', width: 80, align: 'center' },
   { title: '操作', dataIndex: 'action', width: 140, align: 'center' },
 ]
 
@@ -329,6 +406,7 @@ async function loadSites() {
   sites.value = null
   try {
     const res = await fetch('/api/nginx/sites')
+    if (handleUnauthorized(res)) return
     const data = await res.json()
     sitesSupported.value = data.supported !== false
     nginxInstalled.value = data.nginxInstalled === true
@@ -345,13 +423,38 @@ async function loadSites() {
 const siteModalVisible = ref(false)
 const siteSaving = ref(false)
 const editingFile = ref('')
-const siteForm = reactive({ domain: '', listen: 80, root: '' })
+const siteForm = reactive({
+  domain: '',
+  listen: 80,
+  root: '',
+  proxyPort: null, // 反向代理端口；null 表示未启用
+  proxyScheme: 'http', // 反代协议：http / https，留空按 http
+  proxyHost: '', // 反代上游地址；空表示本机 127.0.0.1
+  ssl: false,
+  cert: '',
+  key: '',
+})
+
+// 证书获取方式：upload = 上传证书包，manual = 手动填写路径
+const certMode = ref('manual')
+const certUploading = ref(false)
+const certDir = ref('') // 上传后后端返回的归置目录
+const certFiles = ref([]) // 解压出的文件清单
 
 function openAddSite() {
   editingFile.value = ''
   siteForm.domain = ''
   siteForm.listen = 80
   siteForm.root = ''
+  siteForm.proxyPort = null
+  siteForm.proxyScheme = 'http'
+  siteForm.proxyHost = ''
+  siteForm.ssl = false
+  siteForm.cert = ''
+  siteForm.key = ''
+  certMode.value = 'manual'
+  certDir.value = ''
+  certFiles.value = []
   siteModalVisible.value = true
 }
 
@@ -360,7 +463,65 @@ function openEditSite(record) {
   siteForm.domain = record.domain || ''
   siteForm.listen = record.listen || 80
   siteForm.root = record.root || ''
+  siteForm.proxyPort = record.proxyPort || null
+  siteForm.proxyScheme = record.proxyScheme || 'http'
+  siteForm.proxyHost = record.proxyHost || ''
+  siteForm.ssl = !!record.ssl
+  siteForm.cert = record.cert || ''
+  siteForm.key = record.key || ''
+  // 已填路径时默认展示手动模式，避免误以为证书丢失
+  certMode.value = 'manual'
+  certDir.value = ''
+  certFiles.value = []
   siteModalVisible.value = true
+}
+
+// customUpload 接管 a-upload 的默认提交：需带上域名，并自行解析后端响应回填路径
+function customUpload({ file, onSuccess, onError }) {
+  if (!siteForm.domain.trim()) {
+    antdMessage.warning('请先填写域名 / IP，证书需按域名归置')
+    onError(new Error('域名为空'))
+    return
+  }
+  const form = new FormData()
+  form.append('domain', siteForm.domain.trim())
+  form.append('file', file)
+  certUploading.value = true
+  // 返回 Promise 便于调用方等待（a-upload 本身会忽略返回值）
+  return fetch('/api/nginx/sites/cert', { method: 'POST', body: form })
+    .then((r) => r.json())
+    .then((data) => {
+      certUploading.value = false
+      if (data.error) {
+        antdMessage.error(data.error)
+        onError(new Error(data.error))
+        return
+      }
+      siteForm.cert = data.cert || ''
+      siteForm.key = data.key || ''
+      certDir.value = data.dir || ''
+      certFiles.value = data.files || []
+      if (!data.cert || !data.key) {
+        antdMessage.warning('已解压，但未能自动识别证书或私钥，请检查包内文件或手动填写路径')
+      } else {
+        antdMessage.success('证书已上传并自动填好路径')
+      }
+      onSuccess(data)
+    })
+    .catch((e) => {
+      certUploading.value = false
+      antdMessage.error('上传失败: ' + e.message)
+      onError(e)
+    })
+}
+
+// beforeCertUpload 上传前拦截超大文件，避免白跑一趟
+function beforeCertUpload(file) {
+  const tooBig = file.size > 32 * 1024 * 1024
+  if (tooBig) {
+    antdMessage.error('证书包不能超过 32MB')
+  }
+  return !tooBig
 }
 
 async function saveSite() {
@@ -371,6 +532,12 @@ async function saveSite() {
       domain: siteForm.domain.trim(),
       listen: Number(siteForm.listen) || 80,
       root: siteForm.root.trim(),
+      proxyPort: Number(siteForm.proxyPort) || 0,
+      proxyScheme: siteForm.proxyScheme || 'http',
+      proxyHost: siteForm.proxyHost.trim(),
+      ssl: !!siteForm.ssl,
+      cert: siteForm.cert.trim(),
+      key: siteForm.key.trim(),
     }
     if (editingFile.value) body.file = editingFile.value
     const res = await fetch(url, {
@@ -441,7 +608,35 @@ watch(currentMenu, (m) => {
 </script>
 
 <template>
-  <a-layout style="min-height: 100vh">
+  <!-- 未登录：展示登录页，登录后才能进入安装与配置页面 -->
+  <div v-if="!loggedIn" class="login-wrap">
+    <a-card class="login-card" :bordered="false">
+      <div class="login-logo">nginx_web</div>
+      <div class="login-sub">Nginx 可视化管理控制台</div>
+      <a-form layout="vertical" @submit.prevent="login">
+        <a-form-item>
+          <a-input
+            v-model:value="loginForm.password"
+            type="password"
+            placeholder="请输入登录密码"
+            :disabled="loginLoading"
+            @press-enter="login"
+          >
+            <template #prefix><LockOutlined /></template>
+          </a-input>
+        </a-form-item>
+        <a-form-item>
+          <a-button type="primary" block :loading="loginLoading" @click="login">
+            登录
+          </a-button>
+        </a-form-item>
+        <a-alert v-if="loginError" type="error" show-icon :message="loginError" />
+      </a-form>
+    </a-card>
+  </div>
+
+  <!-- 已登录：主应用 -->
+  <a-layout v-else style="min-height: 100vh">
     <a-layout-sider theme="light" :width="200" class="sider">
       <div class="logo">nginx_web</div>
       <a-menu :selected-keys="[currentMenu]" mode="inline" @click="onMenuClick">
@@ -454,6 +649,7 @@ watch(currentMenu, (m) => {
       <a-layout-header class="header">
         <span class="page-title">{{ currentMenu === 'install' ? '安装' : '站点配置' }}</span>
         <span class="message">{{ message }}</span>
+        <a-button size="small" @click="logout">退出登录</a-button>
       </a-layout-header>
 
       <a-layout-content class="content">
@@ -767,6 +963,16 @@ watch(currentMenu, (m) => {
                     <template v-else-if="column.dataIndex === 'listen'">
                       {{ record.listen || '-' }}
                     </template>
+                    <template v-else-if="column.dataIndex === 'proxyPort'">
+                      <span v-if="record.proxyPort">
+                        {{ (record.proxyScheme || 'http') }}://{{ record.proxyHost || '127.0.0.1' }}:{{ record.proxyPort }}
+                      </span>
+                      <span v-else class="muted">—</span>
+                    </template>
+                    <template v-else-if="column.dataIndex === 'ssl'">
+                      <a-tag v-if="record.ssl" color="green">HTTPS</a-tag>
+                      <span v-else class="muted">—</span>
+                    </template>
                     <template v-else-if="column.dataIndex === 'action'">
                       <a-space :size="4">
                         <a-button type="link" size="small" @click="openEditSite(record)">
@@ -815,12 +1021,94 @@ watch(currentMenu, (m) => {
                   style="width: 100%"
                 />
               </a-form-item>
-              <a-form-item label="网站根目录">
+              <a-form-item label="反向代理端口" tooltip="填写后将把请求转发到上游（反向代理模式），无需填写网站根目录。上游地址可在下方自定义，留空默认本机 127.0.0.1">
+                <a-input-number
+                  v-model:value="siteForm.proxyPort"
+                  :min="1"
+                  :max="65535"
+                  :placeholder="siteForm.ssl || siteForm.root ? '留空则静态托管' : '例如 3000'"
+                  style="width: 100%"
+                />
+              </a-form-item>
+              <template v-if="siteForm.proxyPort">
+                <a-form-item label="反代协议">
+                  <a-select v-model:value="siteForm.proxyScheme" style="width: 100%">
+                    <a-select-option value="http">http</a-select-option>
+                    <a-select-option value="https">https</a-select-option>
+                  </a-select>
+                </a-form-item>
+                <a-form-item label="反代地址" tooltip="上游服务器地址（域名 / IPv4 / IPv6）。留空表示本机 127.0.0.1">
+                  <a-input
+                    v-model:value="siteForm.proxyHost"
+                    placeholder="例如 192.168.1.10 或 [2001:db8::1]，留空则 127.0.0.1"
+                  />
+                </a-form-item>
+              </template>
+              <a-form-item label="网站根目录" tooltip="反向代理模式下可留空">
                 <a-input
                   v-model:value="siteForm.root"
                   placeholder="例如 /var/www/example.com"
                 />
               </a-form-item>
+              <a-form-item label="启用 HTTPS">
+                <a-switch v-model:checked="siteForm.ssl" />
+                <span class="form-hint">启用后需提供证书与私钥</span>
+              </a-form-item>
+              <template v-if="siteForm.ssl">
+                <a-form-item label="证书来源">
+                  <a-radio-group v-model:value="certMode" size="small">
+                    <a-radio-button value="upload">上传证书</a-radio-button>
+                    <a-radio-button value="manual">手动填写路径</a-radio-button>
+                  </a-radio-group>
+                </a-form-item>
+
+                <template v-if="certMode === 'upload'">
+                  <a-form-item
+                    label="证书包"
+                    tooltip="支持 zip / tar.gz / tgz / tar 压缩包，以及 pem / crt / cer / key 单文件。将按域名解压到 nginx 的 conf/ssl 目录下"
+                  >
+                    <a-upload-dragger
+                      :max-count="1"
+                      :show-upload-list="false"
+                      :custom-request="customUpload"
+                      :before-upload="beforeCertUpload"
+                      accept=".zip,.tar.gz,.tgz,.tar,.pem,.crt,.cer,.key"
+                    >
+                      <p class="upload-icon">
+                        <UploadOutlined />
+                      </p>
+                      <p class="upload-text">
+                        {{ certUploading ? '正在上传并解压...' : '点击或拖拽证书包到此处上传' }}
+                      </p>
+                      <p class="upload-hint">
+                        支持 zip / tar.gz / tgz / tar 压缩包；单文件 pem / crt / cer / key 也可直接上传
+                      </p>
+                    </a-upload-dragger>
+                  </a-form-item>
+                  <a-form-item v-if="certDir" label="解压结果">
+                    <div class="cert-dir">{{ certDir }}</div>
+                    <div v-if="certFiles.length" class="cert-files">
+                      <a-tag v-for="f in certFiles" :key="f">{{ f }}</a-tag>
+                    </div>
+                  </a-form-item>
+                </template>
+
+                <a-form-item label="证书路径 (ssl_certificate)">
+                  <a-input
+                    v-model:value="siteForm.cert"
+                    placeholder="上传后自动填充，例如 /usr/local/nginx/conf/ssl/a.com/fullchain.pem"
+                  />
+                </a-form-item>
+                <a-form-item label="私钥路径 (ssl_certificate_key)">
+                  <a-input
+                    v-model:value="siteForm.key"
+                    placeholder="上传后自动填充，例如 /usr/local/nginx/conf/ssl/a.com/privkey.pem"
+                  />
+                </a-form-item>
+                <div v-if="certMode === 'upload'" class="form-hint">
+                  上传成功后上方两个路径会自动填好，确认无误后点「保存」写入 nginx 配置。
+                </div>
+              </template>
             </a-form>
           </a-modal>
         </template>
@@ -860,6 +1148,38 @@ watch(currentMenu, (m) => {
 }
 
 .message {
+  color: #8c8c8c;
+  font-size: 13px;
+}
+
+.header > .ant-btn {
+  margin-left: auto;
+}
+
+.login-wrap {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, #f0f5ff 0%, #f6ffed 100%);
+}
+
+.login-card {
+  width: 360px;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+}
+
+.login-logo {
+  text-align: center;
+  font-size: 22px;
+  font-weight: 700;
+  color: #262626;
+}
+
+.login-sub {
+  text-align: center;
+  margin: 6px 0 20px;
   color: #8c8c8c;
   font-size: 13px;
 }
@@ -952,6 +1272,45 @@ watch(currentMenu, (m) => {
   margin-top: 16px;
   color: #8c8c8c;
   font-size: 13px;
+}
+
+.muted {
+  color: #bfbfbf;
+}
+
+.form-hint {
+  margin-left: 8px;
+  color: #8c8c8c;
+  font-size: 12px;
+}
+
+.upload-icon {
+  margin: 0 0 8px;
+  color: #1677ff;
+  font-size: 26px;
+  line-height: 1;
+}
+
+.upload-text {
+  margin: 0;
+  color: #262626;
+}
+
+.upload-hint {
+  margin: 4px 0 0;
+  color: #8c8c8c;
+  font-size: 12px;
+}
+
+.cert-dir {
+  color: #595959;
+  font-family: monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.cert-files {
+  margin-top: 6px;
 }
 
 .record-panel {

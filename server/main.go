@@ -1,14 +1,20 @@
 package main
 
 import (
+	"archive/tar"
+	"archive/zip"
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -54,6 +60,176 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 func helloHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"message": "Hello, World!"})
+}
+
+// ---------------------------------------------------------------- 登录鉴权
+// 访问安装与配置页面前需先登录。密码来自 .env 的 APP_PASSWORD，未配置时回退默认 admin。
+// 鉴权采用内存态会话令牌（HttpOnly Cookie），满足本工具“单实例、轻量管控”的定位；
+// 不引入外部依赖，也不做持久化（进程重启即视为全部登出，符合运维工具习惯）。
+
+// appPassword 登录密码，由 .env 的 APP_PASSWORD 或环境变量决定，缺省为 admin
+var appPassword = "admin"
+
+// sessionCookieName Cookie 名称
+const sessionCookieName = "nginx_web_session"
+
+// sessions 存放已签发的有效会话令牌，配合 mutex 并发安全
+var (
+	sessionMu sync.Mutex
+	sessions  = make(map[string]time.Time)
+)
+
+// parseDotEnv 解析 .env 文本（不依赖第三方库）：忽略空行与 # 注释，按首个 = 切分，
+// 去除值两侧的单/双引号。供 loadDotEnv 复用，也便于单元测试。
+func parseDotEnv(data string) map[string]string {
+	m := make(map[string]string)
+	for _, line := range strings.Split(data, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		i := strings.Index(line, "=")
+		if i < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:i])
+		val := strings.TrimSpace(line[i+1:])
+		val = strings.Trim(val, "`\"'")
+		if key != "" {
+			m[key] = val
+		}
+	}
+	return m
+}
+
+// loadDotEnv 读取工作目录下的 .env 文件；文件不存在或读取失败时返回空 map
+func loadDotEnv() map[string]string {
+	data, err := os.ReadFile(".env")
+	if err != nil {
+		return map[string]string{}
+	}
+	return parseDotEnv(string(data))
+}
+
+// initPassword 确定登录密码优先级：环境变量 APP_PASSWORD > .env 的 APP_PASSWORD > 默认 admin
+func initPassword() {
+	if p := os.Getenv("APP_PASSWORD"); p != "" {
+		appPassword = p
+		return
+	}
+	if p := loadDotEnv()["APP_PASSWORD"]; p != "" {
+		appPassword = p
+	}
+}
+
+// newSessionToken 生成随机会话令牌
+func newSessionToken() string {
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 16)
+	}
+	return hex.EncodeToString(b)
+}
+
+// loginHandler 校验密码并下发会话 Cookie
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeJSON(w, map[string]string{"error": "仅支持 POST"})
+		return
+	}
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, map[string]string{"error": "请求体解析失败"})
+		return
+	}
+	// 用恒定时间比较，避免密码比对侧信道
+	if subtle.ConstantTimeCompare([]byte(req.Password), []byte(appPassword)) != 1 {
+		writeJSON(w, map[string]string{"error": "密码错误"})
+		return
+	}
+	token := newSessionToken()
+	sessionMu.Lock()
+	sessions[token] = time.Now()
+	sessionMu.Unlock()
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   0, // 会话级 Cookie，关闭浏览器即失效
+	})
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// validSession 依据请求中的会话 Cookie 判断是否为有效登录态
+func validSession(r *http.Request) bool {
+	c, err := r.Cookie(sessionCookieName)
+	if err != nil {
+		return false
+	}
+	sessionMu.Lock()
+	_, ok := sessions[c.Value]
+	sessionMu.Unlock()
+	return ok
+}
+
+// meHandler 返回当前登录态，供前端初始化时判断
+func meHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeJSON(w, map[string]string{"error": "仅支持 GET"})
+		return
+	}
+	writeJSON(w, map[string]any{"authenticated": validSession(r)})
+}
+
+// logoutHandler 注销当前会话并清除 Cookie
+func logoutHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeJSON(w, map[string]string{"error": "仅支持 POST"})
+		return
+	}
+	if c, err := r.Cookie(sessionCookieName); err == nil {
+		sessionMu.Lock()
+		delete(sessions, c.Value)
+		sessionMu.Unlock()
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   -1,
+	})
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// requireAuth 鉴权中间件：除公开接口（健康检查 / 登录 / 身份校验 / 登出）外，
+// 所有 /api/nginx* 接口必须携带有效会话 Cookie，否则返回 401。
+// 静态页面（SPA）在单文件构建下由 / 兜底返回，此处不拦截，
+// 由前端根据 /api/me 决定是否展示登录页，数据接口则全部受保护。
+func requireAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/hello", "/api/login", "/api/me", "/api/logout":
+			next.ServeHTTP(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/nginx") {
+			if !validSession(r) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(map[string]string{"error": "未登录或登录已失效"})
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Linux 上常见的 nginx 安装路径
@@ -841,10 +1017,16 @@ func nginxBin() string {
 
 // siteConfig 描述一个站点的关键字段（由 .conf 文件解析而来）
 type siteConfig struct {
-	File   string `json:"file"`   // 配置文件名，作为唯一标识
-	Domain string `json:"domain"` // server_name 首项；可为域名、IPv4/IPv6 地址或 _ 表示默认
-	Listen int    `json:"listen"` // 监听端口
-	Root   string `json:"root"`   // 网站根目录
+	File        string `json:"file"`        // 配置文件名，作为唯一标识
+	Domain      string `json:"domain"`      // server_name 首项；可为域名、IPv4/IPv6 地址或 _ 表示默认
+	Listen      int    `json:"listen"`      // 监听端口
+	Root        string `json:"root"`        // 网站根目录（静态托管模式）
+	ProxyScheme string `json:"proxyScheme"` // 反代协议：http / https
+	ProxyHost   string `json:"proxyHost"`   // 反代上游地址；空表示 127.0.0.1
+	ProxyPort   int    `json:"proxyPort"`   // 反代上游端口；0 表示未启用（静态托管）
+	SSL         bool   `json:"ssl"`         // 是否启用 HTTPS
+	Cert        string `json:"cert"`        // 证书路径（ssl_certificate）；SSL 开启时必填
+	Key         string `json:"key"`         // 私钥路径（ssl_certificate_key）；SSL 开启时必填
 }
 
 // siteNameRe 合法域名/通配符字符：字母、数字、点、连字符、下划线、通配符 *
@@ -855,6 +1037,24 @@ var ipv4Re = regexp.MustCompile(`^[\d.]+$`)
 
 // ipv6Re IPv6 字符白名单（交由 nginx -t 做最终语义校验）
 var ipv6Re = regexp.MustCompile(`^[A-Za-z0-9:]+$`)
+
+// isValidIPv4 对形如 1.2.3.4 的地址做强校验：四段且每段 0~255
+func isValidIPv4(name string) bool {
+	parts := strings.Split(name, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, p := range parts {
+		if p == "" {
+			return false
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 || n > 255 {
+			return false
+		}
+	}
+	return true
+}
 
 // isValidServerName 判定 server_name 是否合法：支持域名、通配符（*.example.com）、
 // 默认占位 _，以及 IPv4 / IPv6 地址。新增站点不再限定为域名，也可用 IP 标识。
@@ -867,20 +1067,7 @@ func isValidServerName(name string) bool {
 	}
 	// 疑似 IPv4（仅数字与点）：做强校验，避免 999.999.999.999 之类误通过
 	if ipv4Re.MatchString(name) {
-		parts := strings.Split(name, ".")
-		if len(parts) != 4 {
-			return false
-		}
-		for _, p := range parts {
-			if p == "" {
-				return false
-			}
-			n, err := strconv.Atoi(p)
-			if err != nil || n < 0 || n > 255 {
-				return false
-			}
-		}
-		return true
+		return isValidIPv4(name)
 	}
 	// 疑似 IPv6（含冒号）：字符白名单即可，语义由 nginx -t 把关
 	if strings.Contains(name, ":") {
@@ -888,6 +1075,75 @@ func isValidServerName(name string) bool {
 	}
 	// 其余按域名/通配符处理
 	return siteNameRe.MatchString(name)
+}
+
+// defaultProxyHost 反代上游留空时的默认值（本机回环）
+const defaultProxyHost = "127.0.0.1"
+
+// proxyHostRe 反代上游地址字符集：域名、IPv4、IPv6（含方括号写法）
+var proxyHostRe = regexp.MustCompile(`^[A-Za-z0-9._:\[\]-]+$`)
+
+// isValidProxyHost 判定反代上游地址是否合法。允许域名、IPv4、IPv6，
+// 留空表示回环地址 127.0.0.1；路径分隔符与空白一律拒绝，防止注入 nginx 指令。
+func isValidProxyHost(host string) bool {
+	if host == "" {
+		return true
+	}
+	if !proxyHostRe.MatchString(host) {
+		return false
+	}
+	// 疑似 IPv4：复用强校验，挡掉 999.999.999.999
+	if ipv4Re.MatchString(host) {
+		return isValidIPv4(host)
+	}
+	// IPv6：去掉方括号后按字符白名单判定
+	if strings.Contains(host, ":") {
+		bare := strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+		return ipv6Re.MatchString(bare)
+	}
+	return true
+}
+
+// isValidProxyScheme 反代协议仅允许 http / https，留空按 http 处理
+func isValidProxyScheme(scheme string) bool {
+	switch scheme {
+	case "", "http", "https":
+		return true
+	default:
+		return false
+	}
+}
+
+// normalizeProxyHost 渲染前规整上游地址：IPv6 裸地址需补方括号，否则 nginx 无法解析
+func normalizeProxyHost(host string) string {
+	if host == "" {
+		return defaultProxyHost
+	}
+	// 已带方括号的不动；含两个及以上冒号判定为 IPv6
+	if !strings.HasPrefix(host, "[") && strings.Count(host, ":") >= 2 {
+		return "[" + host + "]"
+	}
+	return host
+}
+
+// splitProxyTarget 把 proxy_pass 的目标拆成主机与端口，如
+// "127.0.0.1:3000" -> ("127.0.0.1", "3000")，"[::1]:8080" -> ("::1", "8080")。
+// 主机部分本身含冒号（未加方括号的 IPv6）时不拆分，避免把地址尾段误当端口。
+func splitProxyTarget(target string) (host, port string) {
+	t := strings.TrimSpace(target)
+	if strings.HasPrefix(t, "[") {
+		if i := strings.Index(t, "]"); i >= 0 {
+			host = t[1:i]
+			if rest := strings.TrimPrefix(t[i+1:], ":"); rest != "" {
+				port = rest
+			}
+			return host, port
+		}
+	}
+	if i := strings.LastIndex(t, ":"); i > 0 && !strings.Contains(t[:i], ":") {
+		return t[:i], t[i+1:]
+	}
+	return t, ""
 }
 
 // sanitizeSiteFile 把域名转成安全的文件名，杜绝路径穿越
@@ -904,43 +1160,95 @@ func sanitizeSiteFile(domain string) string {
 	return name
 }
 
-// parseSiteConf 从 server 块文本中提取域名、监听端口与根目录
-func parseSiteConf(content string) (domain string, listen int, root string) {
+// parseSiteConf 从 server 块文本中解析站点关键字段（File 字段不在此处设置）
+func parseSiteConf(content string) (sc siteConfig) {
 	if m := regexp.MustCompile(`listen\s+(\d+)`).FindStringSubmatch(content); m != nil {
-		listen, _ = strconv.Atoi(m[1])
+		sc.Listen, _ = strconv.Atoi(m[1])
 	}
 	if m := regexp.MustCompile(`server_name\s+([^;]+);`).FindStringSubmatch(content); m != nil {
 		if fields := strings.Fields(m[1]); len(fields) > 0 {
-			domain = fields[0]
+			sc.Domain = fields[0]
 		}
 	}
 	if m := regexp.MustCompile(`root\s+([^;]+);`).FindStringSubmatch(content); m != nil {
-		root = strings.TrimSpace(m[1])
+		sc.Root = strings.TrimSpace(m[1])
 	}
-	return domain, listen, root
+	// SSL：listen ... ssl; 或存在 ssl_certificate 指令
+	if regexp.MustCompile(`listen\s+\d+\s+ssl\s*;`).MatchString(content) ||
+		regexp.MustCompile(`ssl_certificate\s+`).MatchString(content) {
+		sc.SSL = true
+	}
+	// 反向代理目标：proxy_pass <scheme>://<host>:<port>，host 可能带 IPv6 方括号
+	if m := regexp.MustCompile(`proxy_pass\s+(https?)://([^/\s]+):(\d+)\s*;`).FindStringSubmatch(content); m != nil {
+		sc.ProxyScheme = m[1]
+		// 去掉 IPv6 地址的方括号，存裸地址；渲染时再由 normalizeProxyHost 补回
+		sc.ProxyHost = strings.TrimSuffix(strings.TrimPrefix(m[2], "["), "]")
+		sc.ProxyPort, _ = strconv.Atoi(m[3])
+	}
+	if m := regexp.MustCompile(`ssl_certificate\s+([^;]+);`).FindStringSubmatch(content); m != nil {
+		sc.Cert = strings.TrimSpace(m[1])
+	}
+	if m := regexp.MustCompile(`ssl_certificate_key\s+([^;]+);`).FindStringSubmatch(content); m != nil {
+		sc.Key = strings.TrimSpace(m[1])
+	}
+	return sc
 }
 
-// renderSiteConf 生成 server 块文本内容
-func renderSiteConf(domain string, listen int, root string) string {
+// renderSiteConf 根据站点输入生成 server 块文本内容。
+// 反向代理模式（ProxyPort>0）生成 proxy_pass；否则静态托管生成 root + try_files。
+// 启用 SSL 时 listen 带 ssl 参数并写入证书指令。
+func renderSiteConf(in siteInput) string {
+	listen := in.Listen
 	if listen <= 0 {
 		listen = 80
 	}
-	logName := strings.NewReplacer("/", "_", ":", "_").Replace(domain)
-	return fmt.Sprintf(`server {
-    listen %d;
-    server_name %s;
+	logName := strings.NewReplacer("/", "_", ":", "_").Replace(in.Domain)
 
-    root %s;
-    index index.html index.htm;
+	var b strings.Builder
+	b.WriteString("server {\n")
+	if in.SSL {
+		fmt.Fprintf(&b, "    listen %d ssl;\n", listen)
+	} else {
+		fmt.Fprintf(&b, "    listen %d;\n", listen)
+	}
+	fmt.Fprintf(&b, "    server_name %s;\n", in.Domain)
 
-    location / {
-        try_files $uri $uri/ =404;
-    }
+	if in.SSL {
+		b.WriteString("\n")
+		fmt.Fprintf(&b, "    ssl_certificate %s;\n", in.Cert)
+		fmt.Fprintf(&b, "    ssl_certificate_key %s;\n", in.Key)
+	}
 
-    access_log %s/logs/%s.access.log;
-    error_log  %s/logs/%s.error.log;
-}
-`, listen, domain, root, installPrefix, logName, installPrefix, logName)
+	if in.ProxyPort > 0 {
+		b.WriteString("\n")
+		b.WriteString("    location / {\n")
+		// 反代上游地址可自定义（默认本机回环 127.0.0.1）；协议留空按 http 处理
+		proxyScheme := in.ProxyScheme
+		if proxyScheme == "" {
+			proxyScheme = "http"
+		}
+		proxyTarget := normalizeProxyHost(in.ProxyHost)
+		fmt.Fprintf(&b, "        proxy_pass %s://%s:%d;\n", proxyScheme, proxyTarget, in.ProxyPort)
+		b.WriteString("        proxy_set_header Host $host;\n")
+		b.WriteString("        proxy_set_header X-Real-IP $remote_addr;\n")
+		b.WriteString("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n")
+		b.WriteString("        proxy_set_header X-Forwarded-Proto $scheme;\n")
+		b.WriteString("    }\n")
+	} else {
+		b.WriteString("\n")
+		fmt.Fprintf(&b, "    root %s;\n", in.Root)
+		b.WriteString("    index index.html index.htm;\n")
+		b.WriteString("\n")
+		b.WriteString("    location / {\n")
+		b.WriteString("        try_files $uri $uri/ =404;\n")
+		b.WriteString("    }\n")
+	}
+
+	fmt.Fprintf(&b, "\n")
+	fmt.Fprintf(&b, "    access_log %s/logs/%s.access.log;\n", installPrefix, logName)
+	fmt.Fprintf(&b, "    error_log  %s/logs/%s.error.log;\n", installPrefix, logName)
+	b.WriteString("}\n")
+	return b.String()
 }
 
 // listSites 读取 config.d 下所有 .conf 文件并解析
@@ -959,18 +1267,263 @@ func listSites() ([]siteConfig, error) {
 		if err != nil {
 			continue
 		}
-		domain, listen, root := parseSiteConf(string(data))
-		sites = append(sites, siteConfig{
-			File:   e.Name(),
-			Domain: domain,
-			Listen: listen,
-			Root:   root,
-		})
+		sc := parseSiteConf(string(data))
+		sc.File = e.Name()
+		sites = append(sites, sc)
 	}
 	sort.Slice(sites, func(i, j int) bool {
 		return sites[i].File < sites[j].File
 	})
 	return sites, nil
+}
+
+// sslBaseDir 证书存放根目录，位于 nginx 的 conf 下，随安装目录一起存在
+func sslBaseDir() string {
+	return filepath.Join(installPrefix, "conf", "ssl")
+}
+
+// certDirName 把站点标识转成安全的目录名，杜绝路径穿越。
+// 先转义分隔符再取 Base：这样分隔符不会残留，随后去掉前导点，避免出现 ".._x" 这类怪名。
+func certDirName(domain string) string {
+	name := strings.TrimSpace(domain)
+	name = strings.NewReplacer("/", "_", "\\", "_", ":", "_").Replace(name)
+	name = filepath.Base(name)
+	name = strings.TrimLeft(name, ".") // 域名不会以点开头，去之可得更干净的名字
+	if name == "" {
+		name = "site"
+	}
+	return name
+}
+
+// certDirFor 返回该站点专属的证书目录，如 /usr/local/nginx/conf/ssl/example.com
+func certDirFor(domain string) string {
+	return filepath.Join(sslBaseDir(), certDirName(domain))
+}
+
+// safeJoin 把归档内的相对路径拼到 destDir 下，并拒绝逃出 destDir 的条目（zip-slip 防护）。
+// 判定先按斜杠做，不依赖 filepath.IsAbs，以免不同平台语义差异导致漏判。
+func safeJoin(destDir, name string) (string, error) {
+	raw := strings.TrimSpace(name)
+	if raw == "" {
+		return "", fmt.Errorf("归档内含有空路径条目")
+	}
+	slash := strings.ReplaceAll(raw, `\`, "/")
+	if strings.HasPrefix(slash, "/") {
+		return "", fmt.Errorf("归档内含有绝对路径: %s", name)
+	}
+	if len(slash) >= 2 && slash[1] == ':' {
+		return "", fmt.Errorf("归档内含有盘符路径: %s", name)
+	}
+	clean := filepath.Clean(filepath.FromSlash(slash))
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("归档内含有越界路径: %s", name)
+	}
+	target := filepath.Join(destDir, clean)
+	// 双重校验：拼接后的绝对路径必须仍在 destDir 之内
+	absDest, err := filepath.Abs(destDir)
+	if err != nil {
+		return "", err
+	}
+	absTarget, err := filepath.Abs(target)
+	if err != nil {
+		return "", err
+	}
+	if absTarget != absDest && !strings.HasPrefix(absTarget, absDest+string(filepath.Separator)) {
+		return "", fmt.Errorf("归档内含有越界路径: %s", name)
+	}
+	return target, nil
+}
+
+// extractCertArchive 按文件后缀把证书包解压到 destDir。
+// 支持 .zip / .tar.gz / .tgz / .tar；其余按单文件直接写入。
+func extractCertArchive(destDir, filename string, data []byte) error {
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return fmt.Errorf("创建证书目录失败: %w", err)
+	}
+	lower := strings.ToLower(filename)
+	switch {
+	case strings.HasSuffix(lower, ".zip"):
+		return extractZip(destDir, data)
+	case strings.HasSuffix(lower, ".tar.gz"), strings.HasSuffix(lower, ".tgz"):
+		return extractTarGz(destDir, data)
+	case strings.HasSuffix(lower, ".tar"):
+		return extractTar(destDir, bytes.NewReader(data))
+	default:
+		// 单文件（.pem / .crt / .cer / .key 等）直接落盘
+		target, err := safeJoin(destDir, filepath.Base(filepath.FromSlash(filename)))
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, 0o644)
+	}
+}
+
+func extractZip(destDir string, data []byte) error {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return fmt.Errorf("zip 解析失败: %w", err)
+	}
+	for _, f := range zr.File {
+		target, err := safeJoin(destDir, f.Name)
+		if err != nil {
+			return err
+		}
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		if err := writeFromReader(target, func() (io.ReadCloser, error) { return f.Open() }, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func extractTarGz(destDir string, data []byte) error {
+	gz, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("gzip 解析失败: %w", err)
+	}
+	defer gz.Close()
+	return extractTar(destDir, gz)
+}
+
+func extractTar(destDir string, r io.Reader) error {
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("tar 解析失败: %w", err)
+		}
+		target, err := safeJoin(destDir, hdr.Name)
+		if err != nil {
+			return err
+		}
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			if err := writeFromReader(target, func() (io.ReadCloser, error) { return io.NopCloser(tr), nil }, os.FileMode(hdr.Mode)&0o777); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// writeFromReader 打开源并落盘，统一走这个入口确保文件句柄被关闭
+func writeFromReader(target string, open func() (io.ReadCloser, error), mode os.FileMode) error {
+	src, err := open()
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	if mode == 0 {
+		mode = 0o644
+	}
+	dst, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+	if _, err := io.Copy(dst, src); err != nil {
+		return err
+	}
+	return dst.Close()
+}
+
+// classifyPEM 依据内容判定文件类型：证书 / 私钥 / 未知。
+// 只看内容不看扩展名，因为各家 CA 下发的文件名并不统一。
+func classifyPEM(content []byte) string {
+	s := string(content)
+	switch {
+	case strings.Contains(s, "BEGIN CERTIFICATE"):
+		return "cert"
+	case strings.Contains(s, "PRIVATE KEY"):
+		// 覆盖 BEGIN PRIVATE KEY / BEGIN RSA PRIVATE KEY / BEGIN EC PRIVATE KEY 等
+		return "key"
+	default:
+		return ""
+	}
+}
+
+// certExts / keyExts 内容无法判定时（如空的占位文件）的兜底依据
+var certExts = map[string]bool{".pem": true, ".crt": true, ".cer": true}
+var keyExts = map[string]bool{".key": true}
+
+// pickCertAndKey 在证书目录中递归查找证书与私钥，返回其绝对路径。
+// 优先按内容判定，其次按扩展名，同类型多个时取路径排序靠前者，保证结果稳定。
+func pickCertAndKey(dir string) (certPath, keyPath string, err error) {
+	var certs, keys []string
+	err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		// 私钥优先使用 0600 之外的常规读取；读取失败不影响其他文件
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(path))
+		switch classifyPEM(data) {
+		case "cert":
+			certs = append(certs, path)
+		case "key":
+			keys = append(keys, path)
+		default:
+			if certExts[ext] {
+				certs = append(certs, path)
+			} else if keyExts[ext] {
+				keys = append(keys, path)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return "", "", err
+	}
+	sort.Strings(certs)
+	sort.Strings(keys)
+	if len(certs) > 0 {
+		certPath = certs[0]
+	}
+	if len(keys) > 0 {
+		keyPath = keys[0]
+	}
+	return certPath, keyPath, nil
+}
+
+// listCertFiles 列出证书目录下的相对路径清单，供前端展示解压结果
+func listCertFiles(dir string) []string {
+	var out []string
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		rel, rerr := filepath.Rel(dir, path)
+		if rerr != nil {
+			rel = filepath.Base(path)
+		}
+		out = append(out, filepath.ToSlash(rel))
+		return nil
+	})
+	sort.Strings(out)
+	return out
 }
 
 // nginxSitesHandler 返回站点列表与 nginx 安装状态
@@ -1016,10 +1569,16 @@ func nginxSitesHandler(w http.ResponseWriter, r *http.Request) {
 
 // siteInput 是新增/修改请求体
 type siteInput struct {
-	File   string `json:"file"` // 修改时必填，定位已有文件
-	Domain string `json:"domain"`
-	Listen int    `json:"listen"`
-	Root   string `json:"root"`
+	File        string `json:"file"`        // 修改时必填，定位已有文件
+	Domain      string `json:"domain"`      // server_name
+	Listen      int    `json:"listen"`      // 监听端口
+	Root        string `json:"root"`        // 网站根目录（静态托管模式）
+	ProxyScheme string `json:"proxyScheme"` // 反代协议：http / https，空按 http
+	ProxyHost   string `json:"proxyHost"`   // 反代上游地址，空按 127.0.0.1
+	ProxyPort   int    `json:"proxyPort"`   // 反代上游端口；0 表示未启用
+	SSL         bool   `json:"ssl"`         // 是否启用 HTTPS
+	Cert        string `json:"cert"`        // 证书路径（ssl 开启时必填）
+	Key         string `json:"key"`         // 私钥路径（ssl 开启时必填）
 }
 
 func (s siteInput) validate() string {
@@ -1032,6 +1591,29 @@ func (s siteInput) validate() string {
 	if s.Listen <= 0 || s.Listen > 65535 {
 		return "监听端口需在 1~65535 之间"
 	}
+	if s.ProxyPort < 0 || s.ProxyPort > 65535 {
+		return "代理端口需在 1~65535 之间（留空表示不启用反向代理）"
+	}
+	// 启用 HTTPS 时必须提供证书与私钥（绝对路径）
+	if s.SSL {
+		if s.Cert == "" || s.Key == "" {
+			return "启用 HTTPS 时需填写证书与私钥路径"
+		}
+		if !strings.HasPrefix(s.Cert, "/") || !strings.HasPrefix(s.Key, "/") {
+			return "证书与私钥路径需为绝对路径"
+		}
+	}
+	// 反向代理模式：由 proxy_pass 转发，不必填根目录
+	if s.ProxyPort > 0 {
+		if !isValidProxyScheme(s.ProxyScheme) {
+			return "反代协议非法，仅支持 http / https"
+		}
+		if !isValidProxyHost(s.ProxyHost) {
+			return "反代上游地址非法（支持域名、IPv4、IPv6，留空表示本机 127.0.0.1）"
+		}
+		return ""
+	}
+	// 静态托管模式：必须填写根目录
 	if s.Root == "" {
 		return "网站根目录不能为空"
 	}
@@ -1073,7 +1655,7 @@ func nginxSiteCreateHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]string{"error": "同名站点已存在: " + file})
 		return
 	}
-	content := renderSiteConf(in.Domain, in.Listen, in.Root)
+	content := renderSiteConf(in)
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		writeJSON(w, map[string]string{"error": "写入配置文件失败: " + err.Error()})
 		return
@@ -1113,7 +1695,7 @@ func nginxSiteUpdateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	newFile := sanitizeSiteFile(in.Domain)
 	newPath := filepath.Join(dir, newFile)
-	content := renderSiteConf(in.Domain, in.Listen, in.Root)
+	content := renderSiteConf(in)
 	// 先写新文件，成功后再删旧文件，避免中途失败丢失配置
 	if err := os.WriteFile(newPath, []byte(content), 0o644); err != nil {
 		writeJSON(w, map[string]string{"error": "写入配置文件失败: " + err.Error()})
@@ -1160,6 +1742,79 @@ func nginxSiteDeleteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true})
+}
+
+// maxCertUpload 证书包体积上限（32MB），远超实际所需，用于挡住误传的大文件
+const maxCertUpload = 32 << 20
+
+// nginxSiteCertUploadHandler 接收上传的证书包，按域名归置到 conf/ssl/<域名>/ 并自动解压。
+// 返回识别出的证书与私钥绝对路径，供前端回填到表单（保存站点时写入 nginx 配置）。
+func nginxSiteCertUploadHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeJSON(w, map[string]string{"error": "仅支持 POST"})
+		return
+	}
+	if !isLinux() {
+		writeJSON(w, map[string]string{"error": "该功能仅支持 Linux（含 Ubuntu）系统"})
+		return
+	}
+	if err := r.ParseMultipartForm(maxCertUpload); err != nil {
+		writeJSON(w, map[string]string{"error": "上传内容解析失败: " + err.Error()})
+		return
+	}
+	domain := strings.TrimSpace(r.FormValue("domain"))
+	if domain == "" {
+		writeJSON(w, map[string]string{"error": "请先填写域名 / IP，再上传证书"})
+		return
+	}
+	if !isValidServerName(domain) {
+		writeJSON(w, map[string]string{"error": "站点标识非法，无法作为证书目录名"})
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeJSON(w, map[string]string{"error": "读取上传文件失败: " + err.Error()})
+		return
+	}
+	defer file.Close()
+
+	if header.Size > maxCertUpload {
+		writeJSON(w, map[string]string{"error": "证书包过大（上限 32MB）"})
+		return
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxCertUpload+1))
+	if err != nil {
+		writeJSON(w, map[string]string{"error": "读取上传内容失败: " + err.Error()})
+		return
+	}
+	if len(data) == 0 {
+		writeJSON(w, map[string]string{"error": "上传文件为空"})
+		return
+	}
+
+	// 同一域名重复上传时先清空旧目录，避免残留文件干扰识别
+	destDir := certDirFor(domain)
+	if err := os.RemoveAll(destDir); err != nil {
+		writeJSON(w, map[string]string{"error": "清理旧证书目录失败: " + err.Error()})
+		return
+	}
+	if err := extractCertArchive(destDir, header.Filename, data); err != nil {
+		writeJSON(w, map[string]string{"error": "解压证书包失败: " + err.Error()})
+		return
+	}
+	certPath, keyPath, err := pickCertAndKey(destDir)
+	if err != nil {
+		writeJSON(w, map[string]string{"error": "识别证书文件失败: " + err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{
+		"ok":    true,
+		"dir":   destDir,
+		"cert":  certPath,
+		"key":   keyPath,
+		"files": listCertFiles(destDir),
+	})
 }
 
 // nginxReloadHandler 重载（必要时重启）nginx，使站点配置变更生效。
@@ -1221,9 +1876,58 @@ func apiPort() string {
 	return p
 }
 
+// registerWebroot 在构建时通过 -tags embed 把前端构建产物（web/dist）编译进二进制，
+// 这里注册一个兜底路由：除 /api 之外的未知路径全部回退到 index.html（SPA 单页应用）。
+// 不带 embed 标签构建时（开发模式、常规单测）embedWebroot 为 false，不注册该路由，
+// 前端仍由 Vite 单独提供，后端只暴露 /api，行为与之前完全一致。
+func registerWebroot(mux *http.ServeMux) {
+	if !embedWebroot {
+		return
+	}
+	sub, err := fs.Sub(webrootFS, "dist")
+	if err != nil {
+		log.Printf("[warn] 嵌入前端资源加载失败，静态页面不可用: %v", err)
+		return
+	}
+	fileServer := http.FileServer(http.FS(sub))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// /api* 一律交给既有 handler；这里只兜底非 API 的页面 / 静态资源请求
+		if strings.HasPrefix(r.URL.Path, "/api") {
+			http.NotFound(w, r)
+			return
+		}
+		upath := strings.TrimPrefix(r.URL.Path, "/")
+		if upath == "" {
+			upath = "index.html"
+		}
+		// 资源存在则按正常流程返回（含正确的 Content-Type）
+		if _, statErr := fs.Stat(sub, upath); statErr == nil {
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		// SPA 路由回退：未知路径直接返回 index.html 内容。
+		// 注意：不能用把 r.URL.Path 改写为 /index.html 再交给 http.FileServer
+		// 的方式——FileServer 会把 /index.html 301 重定向到 /，导致不跟随
+		// 重定向的客户端（部分 curl / 程序化调用）拿到空响应。
+		data, readErr := fs.ReadFile(sub, "index.html")
+		if readErr != nil {
+			http.Error(w, "index.html not found", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(data)
+	})
+}
+
 func main() {
+	// 读取登录密码（.env / 环境变量 / 默认 admin），在任何接口处理前完成
+	initPassword()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/hello", helloHandler)
+	mux.HandleFunc("/api/login", loginHandler)
+	mux.HandleFunc("/api/me", meHandler)
+	mux.HandleFunc("/api/logout", logoutHandler)
 	mux.HandleFunc("/api/nginx", nginxHandler)
 	mux.HandleFunc("/api/nginx/available", nginxAvailableHandler)
 	mux.HandleFunc("/api/nginx/install", nginxInstallHandler)
@@ -1234,12 +1938,16 @@ func main() {
 	mux.HandleFunc("/api/nginx/sites/create", nginxSiteCreateHandler)
 	mux.HandleFunc("/api/nginx/sites/update", nginxSiteUpdateHandler)
 	mux.HandleFunc("/api/nginx/sites/delete", nginxSiteDeleteHandler)
+	mux.HandleFunc("/api/nginx/sites/cert", nginxSiteCertUploadHandler)
 	mux.HandleFunc("/api/nginx/reload", nginxReloadHandler)
+
+	// 单文件构建（-tags embed）时，注册静态页面兜底路由；否则无操作
+	registerWebroot(mux)
 
 	addr := ":" + apiPort()
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           logging(mux),
+		Handler:           logging(requireAuth(mux)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
