@@ -1,11 +1,40 @@
 # nginx_web
 
-linux nginx web
+Linux 上的 Nginx 可视化管理控制台：检测已安装的 nginx、查询可安装版本、一键源码编译安装，
+并通过「站点配置」页面管理 `config.d` 下的站点（静态托管 / 反向代理 / HTTPS 与证书上传）。
+
+- **后端**：Go 单文件，零第三方依赖（标准库 `net/http`）
+- **前端**：Vue 3 + Vite + Ant Design Vue，左侧菜单切换「安装」/「站点配置」两个视图
+- **部署**：`build.sh` 可把前后端打包成**单一可执行文件**（内嵌前端 + upx 压缩）
+- **鉴权**：进入控制台需先登录，密码取自 `.env` 的 `APP_PASSWORD`（默认 `admin`）
+
+> nginx 的检测 / 安装 / 卸载 / 站点配置等**运维能力仅在 Linux（含 Ubuntu）生效**；
+> 在 Windows / macOS 上直接运行时，相关接口返回 `supported: false`，页面会给出提示。
 
 ## 环境要求
 
 - 后端：Go（nginx 相关功能仅支持 Linux / Ubuntu 系统运行）
 - 前端：Node.js + npm
+
+## 项目结构
+
+```text
+.
+├── start.sh            # 本地开发启动脚本（拉起后端 + 前端）
+├── build.sh            # 单文件构建：前端 → 内嵌 → Go 二进制 → 压缩
+├── .env.example        # 登录密码配置模板（复制为 .env 后生效）
+├── server/             # 后端（Go，零第三方依赖）
+│   ├── main.go         # 全部后端逻辑：检测 / 安装 / 卸载 / 站点 / 证书 / 鉴权
+│   ├── main_test.go    # 单元测试
+│   ├── auth_test.go    # 登录鉴权单元测试
+│   ├── embed.go        # //go:build embed   —— 内嵌 server/dist
+│   └── noembed.go      # //go:build !embed  —— 开发 / 测试时的空实现
+└── web/                # 前端（Vue 3 + Vite + Ant Design Vue）
+    └── src/App.vue     # 单文件组件，含登录页与「安装」/「站点配置」两个视图
+```
+
+前端未引入路由，用 `currentMenu` 在单文件内切换视图；`server/dist` 只是构建期的临时目录，
+已被 gitignore，正常情况下不应出现在工作区。
 
 ## 本地开发（WSL）
 
@@ -23,7 +52,7 @@ cd /mnt/d/DDD/xxx/code/nginx_web
 
 启动后访问：
 
-- 前端 <http://localhost:5173>
+- 前端 <http://localhost:5173> —— 打开后会先进入**登录页**，默认密码 `admin`（见 [登录鉴权](#登录鉴权)）
 - 后端 <http://localhost:8080/api/hello>
 
 ### 可用环境变量
@@ -35,8 +64,12 @@ cd /mnt/d/DDD/xxx/code/nginx_web
 | `VITE_POLL` | `/mnt` 下自动 `1` | 强制开启文件轮询监听 |
 | `SKIP_PORT_CLEAN` | `0` | 置 `1` 时停止阶段不清理端口残留进程 |
 | `NO_COLOR` | 空 | 置 `1` 关闭彩色输出 |
+| `APP_PASSWORD` | `admin` | 控制台登录密码。环境变量优先级**高于** `.env` 中的同名配置 |
 
 示例：`PORT=8090 ./start.sh`
+
+> `APP_PASSWORD` 通常在项目根目录的 `.env` 中配置（可参考 `.env.example`），
+> 只有需要临时覆盖时才用环境变量。修改后需重启后端才生效。
 
 ### 手动启动（不走脚本）
 
@@ -152,6 +185,11 @@ location /api/ {
 }
 ```
 
+> **更推荐改用下方的单文件构建**，省去反代与前端托管。若沿用这种分离部署，注意两点：
+> `.env` 需要一并上传到服务器，**且必须在后端进程的工作目录下**（后端按相对路径读取它）；
+> 若找不到 `.env`，密码会**静默回退为默认的 `admin`**，建议部署后用 `admin` 试探一次，
+> 能登录则说明 `.env` 没被读到，应改用环境变量 `APP_PASSWORD` 显式指定。
+
 ### 单文件构建（前后端一体）
 
 `build.sh` 会把前端构建产物（`web/dist`）通过 `//go:embed` 编译进后端二进制，
@@ -195,7 +233,15 @@ cp .env.example .env
 
 ## 接口
 
+公开接口（无需登录）：
+
 - `GET /api/hello` — 连通性测试
+- `POST /api/login` — 登录，body `{ "password": "..." }`，成功后下发会话 Cookie
+- `GET /api/me` — 查询当前登录态，返回 `{ "authenticated": true|false }`
+- `POST /api/logout` — 登出，销毁会话并清除 Cookie
+
+业务接口（**均需登录态**，未登录返回 `401`）：
+
 - `GET /api/nginx` — 检测服务器已安装的 nginx（版本、执行目录）
 - `GET /api/nginx/available` — 通过包管理器（apt / dnf / yum / apk）查询可安装的 nginx 版本
 - `POST /api/nginx/install` — 源码编译安装指定版本，立即返回 `taskId`（异步执行）
@@ -203,12 +249,15 @@ cp .env.example .env
 - `GET /api/nginx/installs` — 读取历史安装记录（配置路径、执行目录等）
 - `POST /api/nginx/uninstall` — 卸载本工具编译安装的 nginx，立即返回 `taskId`（异步执行）
 - `GET /api/nginx/sites` — 读取 `config.d` 下的站点列表（含 nginx 安装状态）
-- `POST /api/nginx/sites/create` — 新增一个站点配置（域名 / 端口 / 根目录）
-- `POST /api/nginx/sites/update` — 修改已有站点配置（按文件名定位，域名变更会换文件名）
+- `POST /api/nginx/sites/create` — 新增站点。字段：`domain`、`listen`、`root`、`proxyPort`、
+  `proxyScheme`、`proxyHost`、`ssl`、`cert`、`key`（反代与 HTTPS 均为可选，见下方站点配置章节）
+- `POST /api/nginx/sites/update` — 修改已有站点配置（按文件名定位，标识变更会换文件名）
 - `POST /api/nginx/sites/delete` — 删除站点配置
 - `POST /api/nginx/sites/cert` — **上传证书包**（`multipart/form-data`，字段 `domain` + `file`），
   按域名解压归置并返回识别出的 `cert` / `key` 绝对路径
 - `POST /api/nginx/reload` — 校验并重载（必要时启动）nginx，使站点配置变更生效
+
+非 Linux 系统下，`/api/nginx*` 系列会返回 `supported: false` 而非报错。
 
 ## 安装功能
 
